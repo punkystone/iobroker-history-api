@@ -6,5 +6,6 @@ services:
       dockerfile: Dockerfile
     environment:
       - IO_BROKER_HOST
+      - IO_BROKER_INSTANCE
     ports:
       - "80:80"

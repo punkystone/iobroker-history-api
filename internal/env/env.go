@@ -6,7 +6,8 @@ import (
 )
 
 type Env struct {
-	Host string
+	Host     string
+	Instance string
 }
 
 func CheckEnv() (*Env, error) {
@@ -14,8 +15,13 @@ func CheckEnv() (*Env, error) {
 	if !exists {
 		return nil, errors.New("IO_BROKER_HOST environment variable not set")
 	}
+	instance, exists := os.LookupEnv("IO_BROKER_INSTANCE")
+	if !exists {
+		return nil, errors.New("IO_BROKER_INSTANCE environment variable not set")
+	}
 	env := &Env{
-		Host: host,
+		Host:     host,
+		Instance: instance,
 	}
 	return env, nil
 }
