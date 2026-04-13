@@ -1,0 +1,10 @@
+services:
+  iobroker-history-api:
+    container_name: iobroker-history-api
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - IO_BROKER_HOST
+    ports:
+      - "80:80"
