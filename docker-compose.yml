@@ -7,5 +7,6 @@ services:
     environment:
       - IO_BROKER_HOST
       - IO_BROKER_INSTANCE
+      - DEBUG
     ports:
       - "80:80"

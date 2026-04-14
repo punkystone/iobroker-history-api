@@ -37,19 +37,23 @@ type HistoryRequest struct {
 	Start     float64 `json:"start"`
 }
 
+const reconnectInterval = time.Second * 5
+
 type HistoryService struct {
 	host            string
 	instance        string
+	debug           bool
 	logger          *slog.Logger
 	connection      *websocket.Conn
 	sendCounter     int
 	responseChannel chan []Point
 }
 
-func NewHistoryService(logger *slog.Logger, host string, instance string) *HistoryService {
+func NewHistoryService(logger *slog.Logger, host string, instance string, debug bool) *HistoryService {
 	return &HistoryService{
 		host:            host,
 		instance:        instance,
+		debug:           debug,
 		logger:          logger,
 		sendCounter:     1,
 		responseChannel: make(chan []Point),
@@ -57,36 +61,30 @@ func NewHistoryService(logger *slog.Logger, host string, instance string) *Histo
 }
 
 func (historyService *HistoryService) Connect() {
-	sid, err := historyService.getSID()
-	if err != nil {
-		historyService.logger.Error("could not get sid", "error", err)
-		return
+	for {
+		shouldReconnect := make(chan struct{}, 1)
+		sid, err := historyService.getSID()
+		if err != nil {
+			historyService.logger.Error("could not get sid", "error", err)
+			return
+		}
+		connection, _, err := websocket.DefaultDialer.Dial(fmt.Sprintf("ws://%s?ws=true&EIO=3&transport=websocket&sid=%s", historyService.host, sid), nil)
+		if err != nil {
+			historyService.logger.Error("could not connect to socket", "error", err)
+			return
+		}
+		historyService.connection = connection
+		historyService.sendCounter = 1
+		go historyService.listen(shouldReconnect)
+		go historyService.ping()
+		historyService.logger.Info("connected", "host", historyService.host)
+		historyService.sendMessage("2probe", false)
+		historyService.sendMessage("5", false)
+		historyService.sendMessage(fmt.Sprintf("42%d[\"authenticate\"]", historyService.sendCounter), true)
+		<-shouldReconnect
+		historyService.logger.Info("reconnecting", "host", historyService.host)
+		time.Sleep(reconnectInterval)
 	}
-	historyService.logger.Info(sid)
-	connection, _, err := websocket.DefaultDialer.Dial(fmt.Sprintf("ws://%s?ws=true&EIO=3&transport=websocket&sid=%s", historyService.host, sid), nil)
-	if err != nil {
-		historyService.logger.Error("could not connect to socket", "error", err)
-		return
-	}
-	historyService.connection = connection
-	historyService.sendCounter = 1
-	historyService.logger.Info("connected")
-	go historyService.listen()
-	go historyService.ping()
-	historyService.sendMessage("2probe", false)
-	historyService.sendMessage("5", false)
-	historyService.sendMessage(fmt.Sprintf("42%d[\"authenticate\"]", historyService.sendCounter), true)
-	time.Sleep(time.Second * 5)
-	/*points, err := historyService.getHistory("mqtt.0.tgn.frient.ElecMeter_1.power", "300", 1776095119857.426, 1776103744737.426)
-	if err != nil {
-		fmt.Println("timeout")
-	}
-	fmt.Println(len(points))
-	points, err = historyService.getHistory("mqtt.0.tgn.frient.ElecMeter_1.power", "300", 1776095119857.426, 1776103744737.426)
-	if err != nil {
-		fmt.Println("timeout")
-	}
-	fmt.Println(len(points))*/
 }
 
 func (historyService *HistoryService) ping() {
@@ -95,7 +93,7 @@ func (historyService *HistoryService) ping() {
 		historyService.sendMessage("2", false)
 	}
 }
-func (historyService *HistoryService) getHistory(id string, count string, start float64, end float64) ([]Point, error) {
+func (historyService *HistoryService) GetHistory(id string, count string, start float64, end float64) ([]Point, error) {
 	historyRequestPayload := &HistoryRequest{
 		Ack:       false,
 		AddID:     false,
@@ -121,7 +119,7 @@ func (historyService *HistoryService) getHistory(id string, count string, start 
 	}
 }
 
-func (historyService *HistoryService) listen() {
+func (historyService *HistoryService) listen(shouldReconnect chan<- struct{}) {
 	for {
 		_, message, err := historyService.connection.ReadMessage()
 		if err != nil {
@@ -129,7 +127,10 @@ func (historyService *HistoryService) listen() {
 			break
 		}
 		trimmedMessage := strings.TrimSpace(string(message))
-		if trimmedMessage == "3" || trimmedMessage == "3probe" {
+		if historyService.debug {
+			historyService.logger.Info("received message", "message", trimmedMessage)
+		}
+		if trimmedMessage == "3" || trimmedMessage == "3probe" || trimmedMessage == "431[true,null]" {
 			continue
 		}
 		bracketIndex := strings.IndexByte(trimmedMessage, '[')
@@ -160,14 +161,16 @@ func (historyService *HistoryService) listen() {
 		}
 		historyService.responseChannel <- points
 	}
-	//reconnect
+	shouldReconnect <- struct{}{}
 }
 
 func (historyService *HistoryService) sendMessage(message string, incrementSendCounter bool) {
 	if historyService.connection == nil {
 		return
 	}
-	historyService.logger.Info(message)
+	if historyService.debug {
+		historyService.logger.Info("send message", "message", message)
+	}
 	err := historyService.connection.WriteMessage(websocket.TextMessage, []byte(message))
 	if err != nil {
 		historyService.logger.Error("write failed", "error", err, "message", message)
@@ -188,7 +191,6 @@ func (historyService *HistoryService) getSID() (string, error) {
 		return "", fmt.Errorf("error reading body of sid request: %w", err)
 	}
 	payload := string(body)
-	historyService.logger.Info(payload)
 	start := strings.Index(payload, "{")
 	end := strings.Index(payload, "}")
 	if start == -1 || end == -1 || end < start {

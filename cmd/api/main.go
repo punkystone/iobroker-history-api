@@ -14,7 +14,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	historyService := history.NewHistoryService(logger, env.Host, env.Instance)
+	historyService := history.NewHistoryService(logger, env.Host, env.Instance, env.Debug)
 	historyService.Connect()
 	err = server.StartServer(logger)
 	if err != nil {
