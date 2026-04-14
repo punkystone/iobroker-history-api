@@ -15,8 +15,8 @@ func main() {
 		panic(err)
 	}
 	historyService := history.NewHistoryService(logger, env.Host, env.Instance, env.Debug)
-	historyService.Connect()
-	err = server.StartServer(logger)
+	go historyService.Connect()
+	err = server.StartServer(logger, historyService)
 	if err != nil {
 		panic(err)
 	}
