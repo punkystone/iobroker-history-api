@@ -9,9 +9,11 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
-	"unicode"
 
 	"github.com/gorilla/websocket"
 )
@@ -37,26 +39,32 @@ type HistoryRequest struct {
 	Start     float64 `json:"start"`
 }
 
+type historyResult struct {
+	Points []Point
+	Err    error
+}
+
 const reconnectInterval = time.Second * 5
 
 type HistoryService struct {
-	host            string
-	instance        string
-	debug           bool
-	logger          *slog.Logger
-	connection      *websocket.Conn
-	sendCounter     int
-	responseChannel chan []Point
+	host       string
+	instance   string
+	debug      bool
+	logger     *slog.Logger
+	connection *websocket.Conn
+	writeMu    sync.Mutex
+	pendingMu  sync.Mutex
+	pending    map[int]chan historyResult
+	nextID     atomic.Int64
 }
 
 func NewHistoryService(logger *slog.Logger, host string, instance string, debug bool) *HistoryService {
 	return &HistoryService{
-		host:            host,
-		instance:        instance,
-		debug:           debug,
-		logger:          logger,
-		sendCounter:     1,
-		responseChannel: make(chan []Point),
+		host:     host,
+		instance: instance,
+		debug:    debug,
+		logger:   logger,
+		pending:  make(map[int]chan historyResult),
 	}
 }
 
@@ -74,13 +82,12 @@ func (historyService *HistoryService) Connect() {
 			return
 		}
 		historyService.connection = connection
-		historyService.sendCounter = 1
 		go historyService.listen(shouldReconnect)
 		go historyService.ping()
 		historyService.logger.Info("connected", "host", historyService.host)
-		historyService.sendMessage("2probe", false)
-		historyService.sendMessage("5", false)
-		historyService.sendMessage(fmt.Sprintf("42%d[\"authenticate\"]", historyService.sendCounter), true)
+		_ = historyService.sendMessage("2probe")
+		_ = historyService.sendMessage("5")
+		_ = historyService.sendMessage(fmt.Sprintf("42%d[\"authenticate\"]", int(historyService.nextID.Add(1))))
 		<-shouldReconnect
 		historyService.logger.Info("reconnecting", "host", historyService.host)
 		time.Sleep(reconnectInterval)
@@ -90,10 +97,21 @@ func (historyService *HistoryService) Connect() {
 func (historyService *HistoryService) ping() {
 	for {
 		time.Sleep(time.Minute)
-		historyService.sendMessage("2", false)
+		_ = historyService.sendMessage("2")
 	}
 }
 func (historyService *HistoryService) GetHistory(id string, count string, start float64, end float64) ([]Point, error) {
+	reqestID := int(historyService.nextID.Add(1))
+	replyChannel := make(chan historyResult, 1)
+	historyService.pendingMu.Lock()
+	historyService.pending[reqestID] = replyChannel
+	historyService.pendingMu.Unlock()
+	defer func() {
+		historyService.pendingMu.Lock()
+		delete(historyService.pending, reqestID)
+		historyService.pendingMu.Unlock()
+	}()
+
 	historyRequestPayload := &HistoryRequest{
 		Ack:       false,
 		AddID:     false,
@@ -110,16 +128,24 @@ func (historyService *HistoryService) GetHistory(id string, count string, start 
 	if err := json.NewEncoder(buffer).Encode(historyRequest); err != nil {
 		return nil, fmt.Errorf("error enconding history request: %w", err)
 	}
-	historyService.sendMessage(fmt.Sprintf("42%d%s", historyService.sendCounter, buffer.String()), true)
+	message := fmt.Sprintf("42%d%s", reqestID, strings.TrimSpace(buffer.String()))
+	if err := historyService.sendMessage(message); err != nil {
+		return nil, err
+	}
 	select {
-	case v := <-historyService.responseChannel:
-		return v, nil
+	case res := <-replyChannel:
+		return res.Points, res.Err
 	case <-time.After(5 * time.Second):
 		return nil, errors.New("response timeout")
 	}
 }
 
 func (historyService *HistoryService) listen(shouldReconnect chan<- struct{}) {
+	defer func() {
+		historyService.failAllPendingRequests(errors.New("connection closed"))
+		shouldReconnect <- struct{}{}
+	}()
+
 	for {
 		_, message, err := historyService.connection.ReadMessage()
 		if err != nil {
@@ -138,35 +164,76 @@ func (historyService *HistoryService) listen(shouldReconnect chan<- struct{}) {
 			historyService.logger.Warn("unknown message", "message", trimmedMessage)
 			continue
 		}
-		for _, r := range trimmedMessage[:bracketIndex] {
-			if !unicode.IsDigit(r) {
-				historyService.logger.Warn("unknown message", "message", trimmedMessage)
-				continue
-			}
-		}
+		prefix := trimmedMessage[:bracketIndex]
 		jsonPart := trimmedMessage[bracketIndex:]
+		if !strings.HasPrefix(prefix, "43") {
+			continue
+		}
+		ackIDStr := strings.TrimPrefix(prefix, "43")
+		ackID, err := strconv.Atoi(ackIDStr)
+		if err != nil {
+			historyService.logger.Warn("invalid ack id", "message", trimmedMessage)
+			continue
+		}
+
+		historyService.pendingMu.Lock()
+		replyChannel := historyService.pending[ackID]
+		historyService.pendingMu.Unlock()
+		if replyChannel == nil {
+			continue
+		}
+
 		raw := []json.RawMessage{}
 		if err := json.NewDecoder(strings.NewReader(jsonPart)).Decode(&raw); err != nil {
-			historyService.logger.Warn("error parsing message", "error", err, "message", trimmedMessage)
+			select {
+			case replyChannel <- historyResult{Err: fmt.Errorf("error parsing message: %w", err)}:
+			default:
+			}
 			continue
 		}
-		if len(raw) < 3 {
-			historyService.logger.Warn("unknown message", "message", trimmedMessage)
+		if len(raw) < 2 {
+			select {
+			case replyChannel <- historyResult{Err: fmt.Errorf("unexpected ack payload: %s", jsonPart)}:
+			default:
+			}
 			continue
 		}
-		points := []Point{}
+
+		var points []Point
 		if err := json.NewDecoder(bytes.NewReader(raw[1])).Decode(&points); err != nil {
-			historyService.logger.Warn("error parsing message", "error", err, "message", trimmedMessage)
+			select {
+			case replyChannel <- historyResult{Err: fmt.Errorf("error parsing points: %w", err)}:
+			default:
+			}
 			continue
 		}
-		historyService.responseChannel <- points
+
+		select {
+		case replyChannel <- historyResult{Points: points}:
+		default:
+		}
 	}
-	shouldReconnect <- struct{}{}
 }
 
-func (historyService *HistoryService) sendMessage(message string, incrementSendCounter bool) {
+func (s *HistoryService) failAllPendingRequests(err error) {
+	s.pendingMu.Lock()
+	pending := s.pending
+	s.pending = make(map[int]chan historyResult)
+	s.pendingMu.Unlock()
+
+	for _, ch := range pending {
+		select {
+		case ch <- historyResult{Err: err}:
+		default:
+		}
+	}
+}
+
+func (historyService *HistoryService) sendMessage(message string) error {
+	historyService.writeMu.Lock()
+	defer historyService.writeMu.Unlock()
 	if historyService.connection == nil {
-		return
+		return errors.New("connection is nil")
 	}
 	if historyService.debug {
 		historyService.logger.Info("send message", "message", message)
@@ -174,11 +241,9 @@ func (historyService *HistoryService) sendMessage(message string, incrementSendC
 	err := historyService.connection.WriteMessage(websocket.TextMessage, []byte(message))
 	if err != nil {
 		historyService.logger.Error("write failed", "error", err, "message", message)
-		return
+		return err
 	}
-	if incrementSendCounter {
-		historyService.sendCounter += 1
-	}
+	return nil
 }
 
 func (historyService *HistoryService) getSID() (string, error) {
@@ -186,6 +251,11 @@ func (historyService *HistoryService) getSID() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("error creating sid url: %w", err)
 	}
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			historyService.logger.Error("close error", "error", err)
+		}
+	}()
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
 		return "", fmt.Errorf("error reading body of sid request: %w", err)
