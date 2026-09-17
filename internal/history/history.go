@@ -79,7 +79,8 @@ func (historyService *HistoryService) Connect() {
 		connection, _, err := websocket.DefaultDialer.Dial(fmt.Sprintf("ws://%s?ws=true&EIO=3&transport=websocket&sid=%s", historyService.host, sid), nil)
 		if err != nil {
 			historyService.logger.Error("could not connect to socket", "error", err)
-			return
+			time.Sleep(time.Second)
+			continue
 		}
 		historyService.connection = connection
 		go historyService.listen(shouldReconnect)
